@@ -341,6 +341,7 @@ class Table(object):
         .. note::
 
             Both tables must be bound to the same :class:`~pyflink.table.TableEnvironment`.
+            Both tables must be bound to the same :class:`~pyflink.table.TableEnvironment`.
 
         Example:
         ::
