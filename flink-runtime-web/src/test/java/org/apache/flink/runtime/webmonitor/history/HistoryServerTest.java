@@ -61,6 +61,7 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
@@ -71,7 +72,11 @@ import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.empty;
+import static org.hamcrest.Matchers.not;
 import static org.junit.Assert.assertTrue;
 
 /**
@@ -128,13 +133,7 @@ public class HistoryServerTest extends TestLogger {
 	@Test
 	public void testHistoryServerIntegration() throws Exception {
 		final int numJobs = 2;
-		for (int x = 0; x < numJobs; x++) {
-			runJob();
-		}
 		final int numLegacyJobs = 1;
-		createLegacyArchive(jmDirectory.toPath());
-
-		waitForArchivesCreation(numJobs + numLegacyJobs);
 
 		CountDownLatch numExpectedArchivedJobs = new CountDownLatch(numJobs + numLegacyJobs);
 
@@ -149,8 +148,16 @@ public class HistoryServerTest extends TestLogger {
 		try {
 			hs.start();
 			String baseUrl = "http://localhost:" + hs.getWebPort();
-			assertTrue(numExpectedArchivedJobs.await(10L, TimeUnit.SECONDS));
 
+			Assert.assertEquals(0, getJobsOverview(baseUrl).getJobs().size());
+
+			for (int x = 0; x < numJobs; x++) {
+				runJob();
+			}
+			createLegacyArchive(jmDirectory.toPath());
+			waitForArchivesCreation(numJobs + numLegacyJobs);
+
+			assertTrue(numExpectedArchivedJobs.await(10L, TimeUnit.SECONDS));
 			Assert.assertEquals(numJobs + numLegacyJobs, getJobsOverview(baseUrl).getJobs().size());
 
 			// checks whether the dashboard configuration contains all expected fields
@@ -258,7 +265,8 @@ public class HistoryServerTest extends TestLogger {
 		waitForArchivesCreation(numJobs);
 
 		CountDownLatch numExpectedArchivedJobs = new CountDownLatch(numJobs);
-		CountDownLatch numExpectedExpiredJobs = new CountDownLatch(numExpiredJobs);
+		CountDownLatch firstArchiveExpiredLatch = new CountDownLatch(numExpiredJobs);
+		CountDownLatch allArchivesExpiredLatch = new CountDownLatch(cleanupExpiredJobs ? numJobs : 0);
 
 		Configuration historyServerConfig = createTestConfiguration(cleanupExpiredJobs);
 
@@ -271,7 +279,8 @@ public class HistoryServerTest extends TestLogger {
 							numExpectedArchivedJobs.countDown();
 							break;
 						case DELETED:
-							numExpectedExpiredJobs.countDown();
+							firstArchiveExpiredLatch.countDown();
+							allArchivesExpiredLatch.countDown();
 							break;
 					}
 				});
@@ -293,9 +302,9 @@ public class HistoryServerTest extends TestLogger {
 			// delete one archive from jm
 			Files.deleteIfExists(jmDirectory.toPath().resolve(jobIdToDelete));
 
-			assertTrue(numExpectedExpiredJobs.await(10L, TimeUnit.SECONDS));
+			assertTrue(firstArchiveExpiredLatch.await(10L, TimeUnit.SECONDS));
 
-			// check that archive is present in hs
+			// check that archive is still/no longer present in hs
 			Collection<JobDetails> jobsAfterDeletion = getJobsOverview(baseUrl).getJobs();
 			Assert.assertEquals(numJobs - numExpiredJobs, jobsAfterDeletion.size());
 			Assert.assertEquals(1 - numExpiredJobs, jobsAfterDeletion.stream()
@@ -303,8 +312,37 @@ public class HistoryServerTest extends TestLogger {
 				.map(JobID::toString)
 				.filter(jobId -> jobId.equals(jobIdToDelete))
 				.count());
+
+			// delete remaining archives from jm and ensure files are cleaned up
+			List<String> remainingJobIds = jobsAfterDeletion.stream()
+				.map(JobDetails::getJobId)
+				.map(JobID::toString)
+				.collect(Collectors.toList());
+
+			for (String remainingJobId : remainingJobIds) {
+				Files.deleteIfExists(jmDirectory.toPath().resolve(remainingJobId));
+			}
+
+			assertTrue(allArchivesExpiredLatch.await(10L, TimeUnit.SECONDS));
+
+			assertJobFilesCleanedUp(cleanupExpiredJobs);
 		} finally {
 			hs.stop();
+		}
+	}
+
+	private void assertJobFilesCleanedUp(boolean jobFilesShouldBeDeleted) throws IOException {
+		try (Stream<Path> paths = Files.walk(hsDirectory.toPath())) {
+			final List<Path> jobFiles = paths
+				.filter(path -> !path.equals(hsDirectory.toPath()))
+				.map(path -> hsDirectory.toPath().relativize(path))
+				.filter(path -> !path.equals(Paths.get("config.json")))
+				.filter(path -> !path.equals(Paths.get("jobs")))
+				.filter(path -> !path.equals(Paths.get("jobs", "overview.json")))
+				.filter(path -> !path.equals(Paths.get("overviews")))
+				.collect(Collectors.toList());
+
+			assertThat(jobFiles, jobFilesShouldBeDeleted ? empty() : not(empty()));
 		}
 	}
 
